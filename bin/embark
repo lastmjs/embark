@@ -1,30 +1,136 @@
 #!/usr/bin/env node
 
-// rebase this out prior to PR:
-// -----------------------------------------------------------------------------
 /* global __dirname __filename process require */
 
-// rebase this out prior to PR:
-// -----------------------------------------------------------------------------
-// need to think about dappPath, pkgJsonPath AND embarkDir, where the latter
-// allows for "direct run" behavior of dapps inside embark itself (e.g. our
-// test dapps)
-
-// rebase these out prior to PR:
-// -----------------------------------------------------------------------------
-function dedent(s) {
-  return s;
-}
-function reformat(s) {
-  return s;
-}
-
-// NOTE: in this script, we shouldn't use JS syntax or node APIs unsupported by
-// any node version >=4.0.0, so unsupported nodes from v4.0.0+ will get
-// embarklog error vs. syntax error or runtime error
+// this script shouldn't use JS syntax or APIs *un*supported by any node
+// version >=4.0.0, so unsupported versions from v4.0.0+ will get embarklog
+// error output instead of a syntax error or runtime error
 // See: https://node.green/
 
-require('colors');
+// KEY ASSUMPTION: for a DApp to be valid, from embark's perspective, it must
+// have a parsable embark.json file in its top-level directory; if that
+// requirement changes in the future (hypothetical example: embark.json info
+// can be embedded in package.json under `{"embark": {...}}` vs. stored in a
+// separate file) then this script must be revised
+
+function main() {
+  // check consistency re: DApp
+  // check consistency re: capitalization at start of embarklog messages
+  // check time diff 3.1.10 version command and this impl's version command
+
+  // -- setup ------------------------------------------------------------------
+
+  var invokedEmbark = (new EmbarkInvoked(__filename)).handle();
+
+  // findUp search begins in process.cwd() by default, but embark.json could be
+  // in a subdir if embark was invoked via `npm run` (which changes cwd to
+  // package.json's dir) and the package.json is in a dir above the top-level
+  // DApp dir; so start at INIT_CWD if that has been set (by npm, presumably)
+  // See: https://docs.npmjs.com/cli/run-script
+  var INIT_CWD = process.env.INIT_CWD ? process.env.INIT_CWD : process.cwd();
+
+  var embarkJson = (new EmbarkJson(
+    findUp.sync('embark.json', {cwd: INIT_CWD})
+  )).handle();
+
+  var dappPath = embarkJson.dirname;
+  // set working dir to dir of embark.json, assumed to be DApp's top-level dir
+  process.chdir(dappPath);
+  process.env.PWD = dappPath;
+
+  var localEmbark;
+
+  var noShim = false;
+  if (process.argv.includes('--no-shim')) {
+    process.argv.splice(process.argv.indexOf('--no-shim'), 1);
+    noShim = true;
+  }
+
+  if (!noShim) {
+    // try to find a "local" embark in or above but not below dappPath
+
+    // let `dappPath/(([../])*)bin/embark` be a local "containing" embark
+
+    // let `dappPath/(([../])*)node_modules/embark/bin/embark` be a local
+    // "installed" embark
+
+    // if a local installed embark is found but is higher in the dir structure
+    // than a found local containing embark, containing embark will be
+    // preferred
+
+    // weird case: according to the above rule and current implementation, if a
+    // local installed embark is found within a local containing embark's own
+    // node_modules dir, installed embark will be preferred
+
+    // invoked embark may find itself as local embark, but that is detected
+    // prior to cmd execution by comparing `cmdrealpath` props
+
+    // if no local embark is found, or realpath lookup for local embark fails,
+    // cmd execution will use invoked embark
+    var containingEmbark = (
+      new EmbarkLocalContaining(
+        findUp.sync('bin/embark', {cwd: dappPath}),
+        invokedEmbark
+      )
+    );
+
+    var installedEmbark = (
+      new EmbarkLocalInstalled(
+        findUp.sync('node_modules/embark/bin/embark', {cwd: dappPath}),
+        invokedEmbark
+      )
+    );
+
+    containingEmbark.setup(installedEmbark);
+    installedEmbark.setup(containingEmbark);
+
+    // per their impls, only one of the two will have pkgDir set
+    if (installedEmbark.pkgDir) {
+      localEmbark = installedEmbark;
+    }
+    if (containingEmbark.pkgDir) {
+      localEmbark = containingEmbark;
+    }
+
+    // look for package.json files from dappDir < ceilingDir that specify
+    // embark as a dependency but don't have embark installed in their relative
+    // node_modules dirs
+    var ceilingDir = localEmbark || null;
+    var foundPkgJsonLocal;
+    var startDir = dappPath;
+
+    function stop() {
+      foundPkgJsonLocal = pkgUp.sync(startDir);
+      var foundDir = foundPkgJsonLocal ? path.dirname(foundPkgJsonLocal) : null;
+      var _stop = !foundDir
+          || foundDir === ceilingDir
+          || (ceilingDir && subdir(foundDir, ceilingDir));
+      if (!_stop) {
+        startDir = path.join(startDir, '..');
+      }
+      return _stop;
+    }
+
+    while (!stop()) {
+      (new PkgJsonLocal(foundPkgJsonLocal)).handle();
+    }
+
+    localEmbark.log();
+  }
+
+  // -- execute ----------------------------------------------------------------
+
+  if (localEmbark
+      && localEmbark.cmdpathreal
+      && localEmbark.cmdpathreal !== invokedEmbark.cmdpathreal) {
+    localEmbark.exec();
+  } else {
+    invokedEmbark.exec();
+  }
+}
+
+// == implementation ===========================================================
+
 var embarklog = require('npmlog');
 var findUp = require('find-up');
 var fs = require('fs');
@@ -35,507 +141,411 @@ var subdir = require('subdir');
 
 embarklog.heading = 'embark';
 
-function reportErrorMissing(e) {
-  embarklog.error('path', e.path);
-  embarklog.error('code', e.code);
-  embarklog.error('errno', e.errno);
-  embarklog.error('syscall', e.syscall);
-  embarklog.error(e.code.toLowerCase(), e.message);
+var _logged = false;
+function logged(which) {
+  var embarklog_which = embarklog[which];
+  return function () {
+    _logged = true;
+    embarklog_which.apply(embarklog, arguments);
+  };
 }
 
-var embarkDir = path.join(__dirname, '..');
-var embarkPkgJson = null;
-var embarkPkgJsonPath = path.join(embarkDir, 'package.json');
-
-try {
-  fs.realpathSync(embarkPkgJsonPath);
-} catch (e) {
-  reportErrorMissing(e);
-  embarklog.error('badpkg', 'embark package could not locate its own package.json file');
-  process.exit(1);
-}
-
-try {
-  embarkPkgJson = require(embarkPkgJsonPath);
-} catch (e) {
-  embarklog.error('json', e.message);
-  embarklog.error('badpkg', 'embark package could not parse its own package.json file');
-  process.exit(1);
-}
-
-var embarkPkg;
-if (!embarkPkgJson.version) {
-  embarklog.warn('json', embarkPkgJsonPath);
-  embarklog.warn('badpkg', 'embark package does not specify its own version in its own package.json file');
-  embarkPkg = 'embark';
-} else {
-  embarkPkg = 'embark@' + embarkPkgJson.version;
-}
-
-// if a source code change is made to the default _nodeRange value below, make
-// sure to manually check that it's a valid semver range, otherwise the
-// fallback logic below won't fully hold
-var _nodeRange = semver.Range('>=8.11.3').range;
-var hasNodeRange;
-var nodeRange;
-try {
-  hasNodeRange = embarkPkgJson.engines.hasOwnProperty('node');
-} catch (e) {
-  hasNodeRange = false;
-} finally {
-  if (!hasNodeRange) {
-    embarklog.warn('path', embarkPkgJsonPath);
-    embarklog.warn('engine', `package.json file of ${embarkPkg} does not specify %j`, {engines: {node: '<range>'}});
-    embarklog.warn('engine', 'Defaulting to: %j', {engines: {node: _nodeRange}});
-    nodeRange = _nodeRange;
-  } else {
-    nodeRange = embarkPkgJson.engines.node;
+function blankLineMaybe(which) {
+  if (_logged) {
+    console[which]();
   }
 }
 
-try {
-  nodeRange = semver.Range(nodeRange).range;
-} catch (e) {
-  embarklog.warn('path', embarkPkgJsonPath);
-  embarklog.warn('engine', `package.json file of ${embarkPkg} does not specify a valid %j`, {engines: {node: '<range>'}});
-  embarklog.warn('engine', 'Specified: %j', {engines: {node: nodeRange}});
-  embarklog.warn('engine', 'Defaulting to: %j', {engines: {node: _nodeRange}});
-  nodeRange = _nodeRange;
-}
-
-var procNodeVer = semver.clean(process.version);
-if (!semver.satisfies(procNodeVer, nodeRange)) {
-  embarklog.error('notsup', 'Unsupported runtime');
-  embarklog.error('notsup', `${embarkPkg} is not compatible with your version of node`);
-  embarklog.error('notsup', 'Required:', nodeRange);
-  embarklog.error('notsup', 'Actual:  ', procNodeVer);
-  process.exit(1);
-}
-
-// NOTE: from this point forward in the script, it's safe to use APIs only
-// available in the min node version we support, i.e. not in older versions;
-// however JS syntax should be kept to what's supported by any node version
-// >=4.0.0
-
-// POC ONLY: what follows doesn't really make sense unless 'shim' defaults to
-// false, so it's more for demo purposes; the env flags are solely for demo
-// purposes, to show how embark would behave if 'direct' and/or 'shim' default
-// to false
-var allowGlobal = {
-  direct: true,
-  shim: true
-  // ^ one or both could default to false in a future version of embark
-};
-if (process.env.hasOwnProperty('embark_no_global_direct')) {
-  allowGlobal.direct = false;
-}
-if (process.env.hasOwnProperty('embark_no_global_shim')) {
-  allowGlobal.shim = false;
-}
-if (process.env.hasOwnProperty('embark_no_global')) {
-  allowGlobal.direct = false;
-  allowGlobal.shim = false;
-}
-if (process.argv.includes('--allow-global-direct')) {
-  process.argv.splice(process.argv.indexOf('--allow-global-direct'), 1);
-  allowGlobal.direct = true;
-}
-if (process.argv.includes('--allow-global-shim')) {
-  process.argv.splice(process.argv.indexOf('--allow-global-shim'), 1);
-  allowGlobal.shim = true;
-}
-if (process.argv.includes('--allow-global')) {
-  process.argv.splice(process.argv.indexOf('--allow-global'), 1);
-  allowGlobal.direct = true;
-  allowGlobal.shim = true;
-}
-
-// if env.npm_lifecycle_script prop exists, a command was invoked via
-// `npm run`, possibly embark itself but maybe something else
 var isNpmRun = process.env.hasOwnProperty('npm_lifecycle_script');
+function blankLineTrailingMaybe(which) {
+  if (isNpmRun) {
+    console[which]();
+  }
+}
 
-function enforceAllowGlobal (which) {
-  if (!allowGlobal[which] && !isNpmRun) {
-    embarklog.error('noglob', 'Unsupported invocation');
-    embarklog.error('noglob', `${embarkPkg} commands should not be invoked globally`);
-    embarklog.error('noglob', 'Within your dapp project directory invoke with:');
-    embarklog.error('noglob', '    npm run embark ' + process.argv.slice(2).join(' ').trim());
+embarklog.error = logged('error');
+embarklog.info = logged('info');
+embarklog.warn = logged('warn');
+
+function callSuper(o, m) {
+  var args = Array.prototype.slice.call(arguments, 2);
+  return Object.getPrototypeOf(o.constructor.prototype)[m].apply(o, args);
+}
+
+function isObject(val) {
+  return val != null && typeof val === 'object' && Array.isArray(val) === false;
+}
+
+function reportMissing(filepath, loglevel) {
+  try {
+    // force the exception
+    fs.realpathSync(filepath);
+  } catch (e) {
+    blankLineMaybe(loglevel);
+    embarklog[loglevel]('path', e.path);
+    embarklog[loglevel]('code', e.code);
+    embarklog[loglevel]('errno', e.errno);
+    embarklog[loglevel]('syscall', e.syscall);
+    embarklog[loglevel](e.code.toLowerCase(), e.message);
+  }
+}
+
+// -- json files ---------------------------------------------------------------
+
+function Json(filepath) {
+  this.filepath = filepath;
+  this.dirname = void 0;
+  this.json = void 0;
+  this.loglevel = 'warn';
+  this.realpath = void 0;
+}
+
+Json.prototype.handle = function () {
+  this.setup();
+  this.log();
+  return this;
+};
+
+Json.prototype.log = function () {
+  this.logMissingFile();
+  this.logUnparsable();
+};
+
+Json.prototype.logMissingFile = function () {
+  if (!this.realpath) {
+    reportMissing(this.filePath, this.loglevel);
+    return true;
+  }
+};
+
+Json.prototype.logUnparsable = function () {
+  if (!this.json) {
+    try {
+      // force the exception
+      require(this.filepath);
+    } catch (e) {
+      blankLineMaybe(this.loglevel);
+      embarklog[this.loglevel]('json', e.message);
+    }
+    return true;
+  }
+};
+
+Json.prototype.setDirname = function () {
+  if (this.realpath) {
+    this.dirname = path.dirname(this.filepath);
+  }
+};
+
+Json.prototype.setJson = function () {
+  if (this.realpath) {
+    try {
+      this.json = require(this.filepath);
+    } catch (e) {}
+  }
+};
+
+Json.prototype.setRealpath = function () {
+  if (this.filepath) {
+    try {
+      this.realpath = fs.realpathSync(this.filepath);
+    } catch (e) {}
+  }
+};
+
+Json.prototype.setup = function () {
+  this.setRealpath();
+  this.setDirname();
+  this.setJson();
+};
+
+// -- embark.json --------------------------------------------------------------
+
+function EmbarkJson(filepath) {
+  callSuper(this, 'constructor', filepath);
+}
+EmbarkJson.prototype = new Json();
+EmbarkJson.prototype.constructor = EmbarkJson;
+
+EmbarkJson.prototype.logMissingFile = function () {
+  this.loglevel = 'error';
+  if (callSuper(this, 'logMissingFile')) {
+    embarklog[this.loglevel]('dapp', `Could not locate your DApp's embark.json file`);
+    embarklog[this.loglevel](
+      'dapp',
+      `Make sure a valid embark.json file exists in your DApp's top-level directory`
+    );
+    blankLineTrailingMaybe(this.loglevel);
     process.exit(1);
   }
-}
+};
 
-function forcePathFail(filename) {
-  try {
-    fs.realpathSync(path.join(process.cwd(), filename));
-  } catch (e) {
-    reportErrorMissing(e);
-    embarklog.error(e.code.toLowerCase(), `Could not locate your DApp's ${filename} file`);
-    embarklog.error(e.code.toLowerCase(), `Make sure a valid ${filename} file exists at the top-level of your DApp project directory`);
+EmbarkJson.prototype.logUnparsable = function () {
+  this.loglevel = 'error';
+  if (callSuper(this, 'logUnparsable')) {
+    embarklog.error('dapp', `your DApp's embark.json file could not be parsed`);
+    blankLineTrailingMaybe(this.loglevel);
+    process.exit(1);
   }
+};
+
+// -- package.json :: of an embark pkg -----------------------------------------
+
+function PkgJsonEmbark(filepath, kind) {
+  callSuper(this, 'constructor', filepath);
+  this.kind = kind || '[PkgJsonEmbark KIND]';
+  this.nodeRange = void 0;
+  this.pkg = void 0;
+  this.version = void 0;
+}
+PkgJsonEmbark.prototype = new Json();
+PkgJsonEmbark.prototype.constructor = PkgJsonEmbark;
+
+PkgJsonEmbark.prototype.log = function () {
+  callSuper(this, 'log');
+  this.logMissingVersion();
+  this.logUnsupportedNode();
+};
+
+PkgJsonEmbark.prototype.logMissingFile = function () {
+  if (callSuper(this, 'logMissingFile')) {
+    embarklog[this.loglevel](
+      'badpkg',
+      `Could not locate ${this.kind} embark's package.json file`
+    );
+    return true;
+  }
+};
+
+PkgJsonEmbark.prototype.logMissingVersion = function () {
+  if (this.version === '???') {
+    blankLineMaybe(this.loglevel);
+    embarklog[this.loglevel]('path', this.filepath);
+    embarklog[this.loglevel](
+      'badpkg',
+      `No version is specified in ${this.kind} embark's package.json file`
+    );
+    return true;
+  }
+};
+
+PkgJsonEmbark.prototype.logUnparsable = function () {
+  if (callSuper(this, 'logUnparsable')) {
+    embarklog[this.loglevel](
+      'badpkg',
+      `Could not parse ${this.kind} embark's package.json file`
+    );
+    return true;
+  }
+};
+
+PkgJsonEmbark.prototype.logUnsupportedNode = function () {
+  var nodeRange = this.nodeRange;
+  if (typeof nodeRange === 'undefined') {
+    blankLineMaybe(this.loglevel);
+    embarklog[this.loglevel]('path', this.filepath);
+    embarklog[this.loglevel](
+      'engine',
+      `package.json of ${this.kind} ${this.pkg} embark does not specify %j`,
+      {engines: {node: '[semver]'}}
+    );
+    embarklog[this.loglevel]('engine', 'Defaulting to: %j', {engines: {node: this.nodeRangeDefault}});
+    nodeRange = this.nodeRangeDefault;
+  }
+
+  try {
+    nodeRange = semver.Range(nodeRange).range;
+  } catch (e) {
+    blankLineMaybe(this.loglevel);
+    embarklog[this.loglevel]('path', this.filepath);
+    embarklog[this.loglevel](
+      'engine'
+      `package.json of ${this.kind} ${this.pkg} embark does not specify a valid %j`,
+      {engines: {node: '[semver]'}}
+    );
+    embarklog[this.loglevel]('engine', 'Specified: %j', {engines: {node: nodeRange}});
+    embarklog[this.loglevel]('engine', 'Defaulting to: %j', {engines: {node: this.defaultNodeRange}});
+    nodeRange = this.nodeRangeDefault;
+  }
+
+  var procNodeVer = semver.clean(process.version);
+  if (!semver.satisfies(procNodeVer, nodeRange)) {
+    var loglevel = 'error';
+    blankLineMaybe(loglevel);
+    embarklog[loglevel]('notsup', 'Unsupported runtime');
+    embarklog[loglevel]('notsup', `${this.kind} ${this.pkg} is not compatible with your version of node`);
+    embarklog[loglevel]('notsup', 'Required:', nodeRange);
+    embarklog[loglevel]('notsup', 'Actual:', procNodeVer);
+    blankLineTrailingMaybe(loglevel);
+    process.exit(1);
+  }
+};
+
+// if making a change to the `nodeRangeDefault` value, make sure to manually
+// check that it's a valid semver range, otherwise the fallback logic in the
+// prototype methods won't be reliable
+PkgJsonEmbark.prototype.nodeRangeDefault = semver.Range('>=8.11.3').range;
+
+PkgJsonEmbark.prototype.setNodeRange = function () {
+  if (isObject(this.json)
+      && this.json.hasOwnProperty('engines')
+      && this.json.engines.hasOwnProperty('node')) {
+    this.nodeRange = this.json.engines.node;
+  }
+};
+
+PkgJsonEmbark.prototype.setPkg = function () {
+  this.pkg = `embark@${this.version}`;
+};
+
+PkgJsonEmbark.prototype.setVersion = function () {
+  if (isObject(this.json) && this.json.version) {
+    this.version = this.json.version;
+  } else {
+    this.version = '???';
+  }
+};
+
+PkgJsonEmbark.prototype.setup = function () {
+  callSuper(this, 'setup');
+  this.setVersion();
+  this.setPkg();
+  this.setNodeRange();
+};
+
+// -- package.json :: local to DApp --------------------------------------------
+
+// if specifies embark as dev/dep but no embark is installed its dir +
+// 'node_modules/embark/bin/embark' then should log warning
+
+function PkgJsonLocal(filepath) {
+  callSuper(this, 'constructor', filepath);
+}
+PkgJsonLocal.prototype = new Json();
+PkgJsonLocal.prototype.constructor = PkgJsonLocal;
+
+// -- package.json :: expected by embark install local to DApp -----------------
+
+// package.json -- expect to exist in EmbarkLocalInstalled.pkgDir + '../../'
+// and expect to specify embark as dev/dep, otherwise log warnings
+
+function PkgJsonLocalExpected(filepath) {
+  callSuper(this, 'constructor', filepath);
+}
+PkgJsonLocalExpected.prototype = new PkgJsonLocal();
+PkgJsonLocalExpected.prototype.constructor = PkgJsonLocalExpected;
+
+// -- bin/embark commands ------------------------------------------------------
+
+function Embark(cmdpath) {
+  this.cmdpath = cmdpath;
 }
 
-// `--shim` option can be used to avoid a direct command run (see below), which
-// is convenient for testing the shimming logic with `embark version --shim`
-var forceShim = false;
-if (process.argv.includes('--shim')) {
-  process.argv.splice(process.argv.indexOf('--shim'), 1);
-  forceShim = true;
-}
+Embark.prototype.exec = function () {
+  throw new Error('not implemented');
+};
 
-function runCmd() {
+Embark.prototype.handle = function () {
+  this.setup();
+  this.log();
+};
+
+Embark.prototype.log = function () {
+  this.pkgJson.log();
+};
+
+Embark.prototype.setCmdrealpath = function () {
+
+};
+
+Embark.prototype.setPkgdir = function () {
+
+};
+
+Embark.prototype.setPkgJson = function () {
+
+};
+
+Embark.prototype.setup = function () {
+  this.setCmdrealpath();
+  this.setPkgDir();
+  this.setPkgJson();
+};
+
+// -- bin/embark :: invoked ----------------------------------------------------
+
+function EmbarkInvoked(cmdpath) {
+  callSuper(this, 'constructor', cmdpath);
+}
+EmbarkInvoked.prototype = new Embark();
+EmbarkInvoked.prototype.constructor = EmbarkInvoked;
+
+EmbarkInvoked.prototype.exec = function () {
   var Cmd = require('../cmd/cmd');
   var cli = new Cmd();
   cli.process(process.argv);
+};
+
+// -- bin/embark :: local ------------------------------------------------------
+
+function EmbarkLocal(cmdpath, invokedEmbark) {
+  callSuper(this, 'constructor', cmdpath);
+  this.invokedEmbark = invokedEmbark;
 }
+EmbarkLocal.prototype = new Embark();
+EmbarkLocal.prototype.constructor = EmbarkLocal;
 
-// directly run an embark command when:
-//   there is no command, only bare `embark`
-//   there is no command, but option is one of: -h, --help, -V, --version
-//   the command is one of: new, demo, version
-if ([void 0,
-     '-h',
-     '--help',
-     '-V',
-     '--version',
-     'demo',
-     'new',
-     'version'].includes(process.argv[2]) && !forceShim) {
-  enforceAllowGlobal('direct');
-  runCmd();
-} else {
-  var pkgDir;
-  // pkgUp search takes place in process.cwd() by default, which is generally
-  // expected to be at some level w/in a Dapp project dir; if $PWD is, for some
-  // weird reason, somewhere in a node_modules tree, then all bets are off
-  var pkgJsonPath = pkgUp.sync();
-  if (!pkgJsonPath) {
-    // force the appropriate error
-    forcePathFail('package.json');
-  } else{
-    pkgDir = path.dirname(pkgJsonPath);
-  }
+EmbarkLocal.prototype.exec = function () {
+  process.argv[1] = this.cmdpath;
+  blankLineMaybe('info');
+  embarklog.info('vers', this.invokedEmbark.pkgJson.version);
+  embarklog.info('path', this.invokedEmbark.cmdpath);
+  embarklog.info('vers', this.pkgJson.version);
+  embarklog.info('path', this.cmdpath);
+  embarklog.info('dapp', `Switching from ${this.invokedEmbark.pkgJson.pkg} to ${this.pkgJson.pkg}`);
+  embarklog.info();
+  require(this.cmdpath);
+};
 
-  var dappDir;
-  // findUp search takes place in process.cwd() by default, which is generally
-  // expected to be at some level w/in a Dapp project directory
-  var embarkJsonPath = findUp.sync('embark.json');
-  if (!embarkJsonPath) {
-    // force the appropriate error
-    forcePathFail('embark.json');
-  } else {
-    embarkDir = path.dirname(embarkJsonPath);
-  }
+EmbarkLocal.prototype.handle = function () {
+  throw new Error('not implemented');
+};
 
-  if (!embarkJsonPath || !pkgJsonPath) {
-    process.exit(1);
-  }
+EmbarkLocal.prototype.setup = function () {
+  throw new Error('not implemented');
+};
 
-  pkgDirWithinEmbarkDir = subdir(embarkDir, pkgDir);
+// -- bin/embark :: local containing -------------------------------------------
 
-  if (embarkJsonPath && pkgJsonPath && !(embarkDir === pkgDir)) {
-    embarklog.error('path', pkgJsonPath);
-    embarklog.error('path', embarkJsonPath);
-    embarklog.error('badapp', 'found package.json and embark.json, but they were not in the same directory');
-    embarklog.error('badapp', 'Make sure valid package.json and embark.json files both exist at the top-level of your DApp project directory');
-    process.exit(1);
-  }
-
-  process.chdir(dappDir);
-
-  var CmdEmbark = require('../lib/index');
-  var cmdPath = __filename;
-  var cmdPathInvoked = process.argv[1];
-  var cmdPathReal = fs.realpathSync(cmdPath);
-  var cmdVersion = semver.clean((new CmdEmbark).version);
-
-  var dotBinCmdPath = path.join(process.cwd(), 'node_modules', '.bin', 'embark');
-  var dotBinCmdPathReal = null;
-  try {
-    dotBinCmdPathReal = fs.realpathSync(dotBinCmdPath);
-  } catch (e) {
-    // embark might be spec'd as a dep but it simply hasn't been installed yet,
-    // so don't report an error or exit the process here
-  }
-
-  if (isNpmRun && (cmdPathReal !== dotBinCmdPathReal)) {
-    isNpmRun = false;
-  }
-  // a "direct local" run of embark would result from:
-  //   `node_modules/.bin/embark [cmd|option] [option(s)]`
-  //   -or-
-  //   `node_modules/embark/bin/embark [cmd|option] [option(s)]`
-  // embark might be symlinked via `npm link` or installed locally (strictly
-  // speaking), but those cases don't need to be treated differently
-  var directLocalRun = (!isNpmRun && (cmdPathReal === dotBinCmdPathReal));
-
-  if (!directLocalRun) {
-    enforceAllowGlobal('shim');
-  }
-
-  /////////
-
-  process.exit(0);
-
-  /////////
-
-  var embarkJson = null;
-  try {
-    embarkJson = require(embarkJsonPath);
-  } catch (e) {
-    embarklog.error('json', e.message);
-    embarklog.error('dapp', 'your DApp\'s embark.json file could not be parsed');
-  }
-
-  var pkgJson = null;
-  try {
-    pkgJson = require(pkgJsonPath);
-  } catch (e) {
-    embarklog.error('json', e.message);
-    embarklog.error('dapp', 'your DApp\'s package.json file could not be parsed');
-  }
-
-  if (!embarkJson || !pkgJson) {
-    process.exit(1);
-  }
-
-  var warned = false;
-  var _warnAboutFallback = true;
-  var warnAboutFallback = false;
-
-  var embarkDepVersionRange = null;
-  var embarkDepVersionRangeMissing = false;
-  var embarkDepVersionRangeValid = null;
-
-  var embarkDevDepVersionRange = null;
-  var embarkDevDepVersionRangeMissing = false;
-  var embarkDevDepVersionRangeValid = null;
-
-  try {
-    embarkDepVersionRange = pkgJson.dependencies.embark;
-  } catch (e) {}
-
-  if (!embarkDepVersionRange) {
-    embarkDepVersionRangeMissing = true;
-  }
-
-  if (!embarkDepVersionRangeMissing) {
-    try {
-      embarkDepVersionRangeValid =
-        semver.Range(embarkDepVersionRange).range;
-    } catch (e) {}
-  }
-
-  try {
-    embarkDevDepVersionRange = pkgJson.devDependencies.embark;
-  } catch (e) {}
-
-  if (!embarkDevDepVersionRange) {
-    embarkDevDepVersionRangeMissing = true;
-  }
-
-  if (!embarkDevDepVersionRangeMissing) {
-    try {
-      embarkDevDepVersionRangeValid =
-        semver.Range(embarkDevDepVersionRange).range;
-    } catch (e) {}
-  }
-
-  if (embarkDepVersionRangeMissing && embarkDevDepVersionRangeMissing) {
-    console.warn(reformat(`
-                    ${`Missing "embark" depedency in package.json`.underline}
-
-                    ${`Embark package was not specified in "dependencies" or "devDependencies" of package.json`.yellow.bold}
-
-                    package.json path: ${pkgJsonPath.yellow.bold}
-
-                    Consider installing the Embark package locally with:
-                    ${`npm install --save embark`.cyan}
-                `));
-    warned = true;
-  }
-
-  if (!embarkDepVersionRangeMissing && !embarkDevDepVersionRangeMissing) {
-    console.warn(reformat(`
-                    ${`Multiple "embark" depedencies in package.json`.underline}
-
-                    ${`Embark package was specified in both "dependencies" and "devDependencies" of package.json`.yellow.bold}
-
-                    package.json path: ${pkgJsonPath.yellow.bold}
-                `));
-    warned = true;
-  }
-
-  function warnInvalid(which) {
-    console.warn(reformat(`
-                    ${`Bad "embark" depedency in package.json`.underline}
-
-                    ${`Embark package was invalidly specified in "${which}" of package.json`.yellow.bold}
-
-                    package.json path: ${pkgJsonPath.yellow.bold}
-                `));
-    warned = true;
-  }
-
-  if (!embarkDepVersionRangeMissing && !embarkDepVersionRangeValid) {
-    warnInvalid('dependencies');
-  }
-
-  if (!embarkDevDepVersionRangeMissing && !embarkDevDepVersionRangeValid) {
-    warnInvalid('devDependencies');
-  }
-
-  // if (!(isNpmRun
-  //       || cmdPathReal === localDotBinCmdPathReal) && !localDotBinCmdPathReal) {
-  //   console.warn(reformat(`
-  //               ${`Missing package-local embark command`.underline}
-  //
-  //               ${`File not found`.yellow.bold}
-  //
-  //               command path: ${localDotBinCmdPath.yellow.bold}
-  //
-  //               Consider installing the Embark package locally with:
-  //               ${`npm install --save embark`.cyan}
-  //           `));
-  //   warned = true;
-  //   warnAboutFallback = true;
-  // }
-
-  var PkgCmdEmbark = null;
-  var pkgCmdPath = localDotBinCmdPath;
-  var pkgCmdPathReal = localDotBinCmdPathReal;
-  var pkgCmdVersion = null;
-
-  if (pkgCmdPathReal && cmdPathReal !== pkgCmdPathReal) {
-    try {
-      PkgCmdEmbark = require(
-        path.join(path.dirname(pkgCmdPath), '../embark/lib/index')
-      );
-      pkgCmdVersion = semver.clean((new PkgCmdEmbark).version);
-
-      var suggestNpmRunOnly = dedent(`
-                    Consider invoking Embark commands in your DApp directory with:
-                    ${`npm run embark <cmd> [options]`.cyan}
-                    When specifying options but not a command do:
-                    ${`npm run embark -- [options]`.cyan}
-                `.trim());
-
-      var suggestNpmRunAndScripts = dedent(`
-                    Consider adding an embark script to package.json:
-                    ${`{"scripts": {"embark": "embark"}}`.cyan}
-                    Then invoke Embark commands in your DApp directory with:
-                    ${`npm run embark <cmd> [options]`.cyan}
-                    When specifying options but not a command do:
-                    ${`npm run embark -- [options]`.cyan}
-                `.trim());
-
-      function suggestNpmRun() {
-        var embarkScript = null;
-        var hasEmbarkScript = false;
-        try {
-          embarkScript = pkgJson.scripts.embark;
-          if (embarkScript) {
-            hasEmbarkScript = true;
-          }
-        } catch (e) {}
-        if (hasEmbarkScript) {
-          return suggestNpmRunOnly;
-        } else {
-          return suggestNpmRunAndScripts;
-        }
-      }
-
-      if (cmdVersion !== pkgCmdVersion) {
-        console.warn(reformat(`
-                        ${`Embark version mismatch`.underline}
-
-                        ${`Invoked cli was a different version than package-local embark command`.yellow.bold}
-
-                        ${pkgCmdVersion.green.bold} \t local \t\t ${pkgCmdPath}
-                        ${cmdVersion.yellow.bold} \t invoked \t ${cmdPathInvoked}
-
-                        Redirecting to ${`local`.green.bold} embark command
-
-                        ${suggestNpmRun()}
-                    `));
-        warned = true;
-      } else {
-        console.warn(reformat(`
-                        ${`Embark command redirection`.underline}
-
-                        ${`local`.green.bold} \t\t ${pkgCmdPath}
-                        ${`invoked`.magenta.bold} \t ${cmdPathInvoked}
-
-                        Redirecting to ${`local`.green.bold} embark command
-
-                        ${suggestNpmRun()}
-                    `));
-        warned = true;
-      }
-    } catch (e) {
-      console.warn(reformat(`
-                    ${`Missing version information`.underline}
-
-                    ${`Version info could not be obtained from package-local embark command`.yellow.bold}
-
-                    local command path: ${pkgCmdPath.yellow.bold}
-                `));
-      warned = true;
-      warnAboutFallback = true;
-    }
-  }
-
-  function warnMismatch(which) {
-    var missing;
-    var range;
-
-    switch (which) {
-    case 'dependencies':
-      missing = embarkDepVersionRangeMissing;
-      range = embarkDepVersionRangeValid;
-      break;
-    case 'devDependencies':
-      missing = embarkDevDepVersionRangeMissing;
-      range = embarkDevDepVersionRangeValid;
-      break;
-    }
-
-    if (!missing
-        && pkgCmdVersion
-        && !semver.satisfies(pkgCmdVersion, range)) {
-      console.warn(reformat(`
-                    ${`Embark version mismatch`.underline}
-
-                    ${`Version range for Embark package specified in "${which}" of package.json
-                            is not satisfied by package-local embark command`.yellow.bold}
-
-                    ${`${range}`.green.bold} \t range
-                    ${`${pkgCmdVersion}`.yellow.bold} \t\t version
-
-                    local command path: ${pkgCmdPath.yellow.bold}
-                    package.json path:  ${pkgJsonPath.green.bold}
-                `));
-      warned = true;
-    }
-  }
-
-  warnMismatch('dependencies');
-  warnMismatch('devDependencies');
-
-  if (pkgCmdVersion) {
-    if (warned) { console.log(); }
-    process.argv[1] = pkgCmdPath;
-    require(pkgCmdPath);
-  } else {
-    if (_warnAboutFallback && warnAboutFallback) {
-      console.warn(reformat(`
-                    ${`Embark cli fallback`.underline}
-
-                    ${`Running invoked command directly instead of redirecting to package-local command`.yellow.bold}
-
-                    invoked command path: ${cmdPathInvoked.magenta.bold}
-                `));
-    }
-    if (warned) { console.log(); }
-    runCmd();
-  }
+function EmbarkLocalContaining(cmdpath, invokedEmbark) {
+  callSuper(this, 'constructor', cmdpath, invokedEmbark);
 }
+EmbarkLocalContaining.prototype = new EmbarkLocal();
+EmbarkLocalContaining.prototype.constructor = EmbarkLocalContaining;
+
+EmbarkLocalContaining.prototype.setup = function (installedEmbark) {
+  //
+};
+
+// -- bin/embark :: local installed --------------------------------------------
+
+// this one will setup two pkg Jsons -- one for its own package.json, the other for expected
+// locally installed package (relative) to Dapp
+
+function EmbarkLocalInstalled(cmdpath, invokedEmbark) {
+  callSuper(this, 'constructor', cmdpath, invokedEmbark);
+}
+EmbarkLocalInstalled.prototype = new EmbarkLocal();
+EmbarkLocalInstalled.prototype.constructor = EmbarkLocalInstalled;
+
+EmbarkLocalInstalled.prototype.log = function () {
+  // call both pkg json log
+};
+
+EmbarkLocalInstalled.prototype.setup = function (containingEmbark) {
+  //
+};
+
+// == run ======================================================================
+
+main();
