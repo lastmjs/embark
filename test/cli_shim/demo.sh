@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 
-# think about order of demo behavior scripts, maybe put the one's re: global
-# missing/bad and `npm install .` w/o old node/npm versions towards the end
-
-# don't forget to do an asciicast w/ asciinema, make sure to speed it up 3x
+# rebase this out prior to PR:
+# ------------------------------------------------------------------------------
+# don't forget to do an asciicast w/ asciinema, make sure to speed it up 3x;
+# provide a short version, just the demos; and long version, full build and
+# demos
 
 reset_shim_demo() {
     local EMBARK_DOCKER_IMAGE="${EMBARK_DOCKER_IMAGE:-statusim/embark}"
@@ -36,16 +37,21 @@ run_shim_demo () {
     local EMBARK_DOCKER_RUN_RM
     local EMBARK_DOCKER_TAG="${EMBARK_DOCKER_TAG:-latest}"
     local EMBARK_DOCKERFILE="${EMBARK_DOCKERFILE}"
-    # ^ can override with local /path/to/embark-docker/ or a url such as:
+    # ^ can override with a local path:
+    #   /path/to/embark-docker/Dockerfile
+    # or a url such as:
     #   https://github.com/embark-framework/embark-docker.git#master
-    # ^ if this env var is not empty, it will trigger `docker build` instead of
-    #   `docker pull` in step-0
+    # if EMBARK_DOCKERFILE is not empty, it will trigger `docker build` instead
+    # of `docker pull` in step-0 below
+    local url_regex='^(https?|ftp|file)://[-A-Za-z0-9\+&@#/%?=~_|!:,.;]*[-A-Za-z0-9\+&@#/%=~_|]'
+    if [[ ! "$EMBARK_DOCKERFILE" =~ $url_regex ]]; then
+        EMBARK_DOCKERFILE="${EMBARK_DOCKERFILE%/*}"
+    fi
     local EMBARK_SHIM_DEMO_DEV=${EMBARK_SHIM_DEMO_DEV:-false}
     local EMBARK_VERSION="${EMBARK_VERSION:latest}"
     # ^ only kicks in for `docker build`, not `docker pull`
     local REAL="${REAL:-https://gist.githubusercontent.com/michaelsbradleyjr/87b5a99ad551e04cbad9c0c1d3af412b/raw/bfec2e589a91302b30f1d7cac8c2df71e5ebabe0/real.sh}"
     local RUNNER="${RUNNER:-https://raw.githubusercontent.com/embark-framework/embark-docker/master/run.sh}"
-    # ^ for local fs override spec URL with file:///path/to/run.sh
 
     local shim_demo_tag
     if [[ (! -z "$EMBARK_DOCKERFILE") \
@@ -57,11 +63,19 @@ run_shim_demo () {
     local __shim_demo_tag="$shim_demo_tag"
     local was_reset=false
     local work_dir="$PWD"
-    source <(curl "$REAL" 2> /dev/null)
+    if [[ "$REAL" =~ $url_regex ]]; then
+        source <(curl "$REAL" 2> /dev/null)
+    else
+        source "$REAL"
+    fi
     local script_dir="$(real_dir "$BASH_SOURCE")"
     local embark_dir="$(real_dir "$script_dir/../..")"
     local cid_file="$script_dir/.cid"
-    source <(curl "$RUNNER" 2> /dev/null)
+    if [[ "$RUNNER" =~ $url_regex ]]; then
+        source <(curl "$RUNNER" 2> /dev/null)
+    else
+        source "$RUNNER"
+    fi
 
     check_image () {
         local tag
@@ -97,9 +111,9 @@ run_shim_demo () {
         if [[ ! -z "$EMBARK_DOCKERFILE" ]]; then
             # could expand the --build-arg list (and list of locals at top of
             # function) w/ all the build args supported by embark-docker's
-            # Dockerfile; would be nice if it was super flexible, maybe
-            # forwarding all env variables that starts with 'EMBARK_', so as
-            # the Dockerfile evolves don't have to revise the lists
+            # Dockerfile; should probably be the responsibility of a
+            # build_embark.sh script/function in embark-docker repo that parses
+            # and dedupes all ARG variables in embark-docker's Dockerfile
             docker build \
                    --build-arg EMBARK_VERSION="$EMBARK_VERSION" \
                    -t "${EMBARK_DOCKER_IMAGE}:${EMBARK_DOCKER_TAG}" \
@@ -169,7 +183,7 @@ run_shim_demo () {
 	#!/bin/bash
 	simple_nodeenv 8.11.2 pre-8.11.3
 	simple_nodeenv 8.11.4 lts
-	npm install -g npm@6.4.0
+	npm install -g npm@6.4.1
 	npm install -g json
 	nac default
 	SCRIPT
@@ -214,9 +228,10 @@ run_shim_demo () {
 	    mkdir -p ~/repos/embark
 	    git clone https://github.com/embark-framework/embark.git \
 	              ~/repos/embark
+	    pushd "$PWD" &> /dev/null
 	    cd ~/repos/embark \
 	        && git checkout "$embark_branch" \
-	        && cd - &> /dev/null
+	        && popd &> /dev/null
 	fi
 	mkdir -p ~/working/embark
 	rsync -a \
@@ -225,6 +240,7 @@ run_shim_demo () {
 	      --exclude=test/cli_shim/.cid \
 	      ~/repos/embark \
 	      ~/working/
+	pushd "$PWD" &> /dev/null
 	cd ~/working/embark
 	git config --global user.email "foo@bar"
 	git config --global user.name "Foo Bar"
@@ -234,7 +250,7 @@ run_shim_demo () {
 	nac lts
 	npm install
 	npm link
-	cd - &> /dev/null
+	popd &> /dev/null
 	nac default
 	SCRIPT
         )
@@ -294,19 +310,18 @@ run_shim_demo () {
 	          ~/repos/embark \
 	          ~/working/
 	fi
+	pushd "$PWD" &> /dev/null
 	cd ~/working/embark
 	git add -A
 	git commit -m 'synced!'
-	cd - &> /dev/null
 	cd ~
 	nac default
 	embark demo
-	cd - &> /dev/null
-	cd ~/embark_demo
+	cd embark_demo
 	git init
 	git add -A
 	git commit -m 'committed!'
-	cd - &> /dev/null
+	popd &> /dev/null
 	SCRIPT
         )
         # do not alter indentation, tabs in lines above
@@ -361,10 +376,11 @@ run_shim_demo () {
 	          ~/repos/embark \
 	          ~/working/
 	fi
+	pushd "$PWD" &> /dev/null
 	cd ~/working/embark
 	git add -A
 	git commit -m 'synced!'
-	cd - &> /dev/null
+	popd &> /dev/null
 	txtbld=\$(tput bold)
 	txtrst=\$(tput sgr0)
 	bldcyn=\${txtbld}\$(tput setaf 6)
@@ -380,14 +396,14 @@ run_shim_demo () {
 	export -f say
 	export PROMPT_COMMAND="echo; echo"
 	# demos
-	$(< "$script_dir/demos/global_missing_json.sh")
-	$(< "$script_dir/demos/global_bad_json.sh")
-	$(< "$script_dir/demos/global_no_version.sh")
-	$(< "$script_dir/demos/global_no_node_engine.sh")
-	$(< "$script_dir/demos/global_bad_node_engine.sh")
+	$(< "$script_dir/demos/invoked_missing_json.sh")
+	$(< "$script_dir/demos/invoked_bad_json.sh")
+	$(< "$script_dir/demos/invoked_no_version.sh")
+	$(< "$script_dir/demos/invoked_no_node_engine.sh")
+	$(< "$script_dir/demos/invoked_bad_node_engine.sh")
 	$(< "$script_dir/demos/pre-8.11.3-runtime.sh")
-	$(< "$script_dir/demos/global-disallowed.sh")
-	$(< "$script_dir/demos/global-disallowed_npm_run.sh")
+	$(< "$script_dir/demos/non-local-disallowed.sh")
+	$(< "$script_dir/demos/non-local-disallowed_npm_run.sh")
 	trap "exit 0" SIGINT && while true; do sleep 1; done
 	SCRIPT
     )
